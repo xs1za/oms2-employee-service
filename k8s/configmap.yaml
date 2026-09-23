@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oms2-config
+  namespace: oms
+data:
+  DEBUG: "false"
+  ALLOWED_HOSTS: "*"
+  FORCE_SCRIPT_NAME: /oms2
+  CSRF_TRUSTED_ORIGINS: http://oms.local
+  KAFKA_BOOTSTRAP_SERVERS: kafka.oms.svc.cluster.local:9092

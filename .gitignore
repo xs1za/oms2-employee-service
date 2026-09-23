@@ -1,0 +1,15 @@
+.idea/
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+*.env
+.venv/
+env/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.log
+db.sqlite3
+staticfiles/
+k8s/secret.yaml

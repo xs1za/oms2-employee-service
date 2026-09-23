@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Employees</title>
+</head>
+<body>
+<h4>Список сотрудников</h4>
+{% for employee in data %}
+<div>
+    <h5>{{ employee.firstname }} {{ employee.surname }}</h5>
+    <p>Перс. номер: {{ employee.personnel_number }}</p>
+    <p>Пол: {{ employee.gender }}</p>
+</div>
+{% empty %}
+<p>Сотрудников пока нет.</p>
+{% endfor %}
+</body>
+</html>

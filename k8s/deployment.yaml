@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oms2
+  namespace: oms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oms2
+  template:
+    metadata:
+      labels:
+        app: oms2
+    spec:
+      initContainers:
+        - name: migrate
+          image: oms2:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              python - <<'PY'
+              import socket
+              import time
+
+              host = "oms2-postgres"
+              port = 5432
+              for attempt in range(60):
+                  try:
+                      with socket.create_connection((host, port), timeout=2):
+                          break
+                  except OSError:
+                      print(f"Waiting for {host}:{port}...", flush=True)
+                      time.sleep(2)
+              else:
+                  raise SystemExit("Postgres is not available")
+              PY
+              python manage.py migrate --noinput
+          envFrom:
+            - configMapRef:
+                name: oms2-config
+            - secretRef:
+                name: oms2-secret
+      containers:
+        - name: oms2
+          image: oms2:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: oms2-config
+            - secretRef:
+                name: oms2-secret
+          readinessProbe:
+            httpGet:
+              path: /health/ready/
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live/
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 20
