@@ -193,19 +193,15 @@ kubectl apply -f k8s/deployment.yaml
 kubectl apply -f k8s/service.yaml
 ```
 
-Для локального доступа:
-
-```bash
-kubectl -n oms port-forward svc/oms2 8002:80
-```
-
-После port-forward HTML/admin/API страницы доступны по адресам:
+При установленном Ingress из `platform/k8s/ingress.yaml` HTML/admin/API страницы доступны без port-forward:
 
 ```text
-http://localhost:8002/admin/
-http://localhost:8002/employees/
-http://localhost:8002/api/employees/
+http://oms.local/oms2/admin/
+http://oms.local/oms2/employees/
+http://oms.local/oms2/api/employees/
 ```
+
+Если Ingress недоступен, для отладки можно использовать `kubectl -n oms port-forward svc/oms2 8002:80` и открыть `http://localhost:8002/admin/`.
 
 ## Важно для production
 
