@@ -206,10 +206,3 @@ http://localhost:8002/admin/
 http://localhost:8002/employees/
 http://localhost:8002/api/employees/
 ```
-
-## Важно для production
-
-- `OMS2/k8s/postgres.yaml` использует `PersistentVolumeClaim` `oms2-postgres-data`, поэтому данные переживают пересоздание pod.
-- Для production лучше использовать управляемую PostgreSQL/PostGIS БД или явно настроенный StorageClass/backup policy.
-- Добавить авторизационную middleware-проверку JWT через `OMS1`.
-- Добавить полноценные CRUD endpoint-ы и валидацию входных данных.
