@@ -10,6 +10,9 @@ env = environ.Env(
     SECRET_KEY=(str, "change-me"),
     DATABASE_URL=(str, "postgis://oms2:oms2@oms2-postgres:5432/oms2"),
     KAFKA_BOOTSTRAP_SERVERS=(str, "kafka.oms.svc.cluster.local:9092"),
+    OMS1_AUTH_BASE_URL=(str, "http://oms1.oms.svc.cluster.local"),
+    SERVICE_CLIENT_ID=(str, "OMS2"),
+    SERVICE_CLIENT_SECRET=(str, ""),
     FORCE_SCRIPT_NAME=(str, ""),
     CSRF_TRUSTED_ORIGINS=(list, ["http://oms.local"]),
 )
@@ -19,6 +22,9 @@ DEBUG = env("DEBUG")
 SECRET_KEY = env("SECRET_KEY")
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["*"])
 KAFKA_BOOTSTRAP_SERVERS = env("KAFKA_BOOTSTRAP_SERVERS")
+OMS1_AUTH_BASE_URL = env("OMS1_AUTH_BASE_URL")
+SERVICE_CLIENT_ID = env("SERVICE_CLIENT_ID")
+SERVICE_CLIENT_SECRET = env("SERVICE_CLIENT_SECRET")
 FORCE_SCRIPT_NAME = env("FORCE_SCRIPT_NAME") or None
 CSRF_TRUSTED_ORIGINS = env.list("CSRF_TRUSTED_ORIGINS")
 CSRF_COOKIE_NAME = "oms2_csrftoken"

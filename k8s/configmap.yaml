@@ -9,3 +9,5 @@ data:
   FORCE_SCRIPT_NAME: /oms2
   CSRF_TRUSTED_ORIGINS: http://oms.local
   KAFKA_BOOTSTRAP_SERVERS: kafka.oms.svc.cluster.local:9092
+  OMS1_AUTH_BASE_URL: http://oms1.oms.svc.cluster.local
+  SERVICE_CLIENT_ID: OMS2
