@@ -1,40 +1,55 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import re
 from functools import wraps
 from uuid import UUID
 
+from django.contrib.gis.geos import Point
 from django.db import IntegrityError, transaction
-from django.db.models import Q
 from django.http import HttpRequest, JsonResponse
 from django.utils import timezone as django_timezone
 from django.views.decorators.csrf import csrf_exempt
 
 from apps.employees.auth import authorize
-from apps.employees.events import (
-    enqueue_employment_changed,
-    enqueue_identity_changed,
-    enqueue_membership_changed,
-    enqueue_performer_profile_changed,
-)
+from apps.employees.events import enqueue_identity_changed, enqueue_performer_profile_changed
+from apps.employees.funnel import recompute_funnel_stage
 from apps.employees.models import (
+    Address,
     ApiIdempotencyRecord,
-    EmploymentEpisode,
-    ExternalMembership,
+    PerformerEngagementTypeChange,
+    PerformerProfile,
+    PerformerWorkPeriod,
     Person,
+    PersonAddress,
     PersonContact,
     PersonDocument,
     PersonIdentifier,
     PersonMerge,
     PersonNameHistory,
-    PerformerProfile,
-    PositionAssignment,
 )
-from apps.employees.privacy import encrypt_value, lookup_hmac, normalize_document_number, normalize_email, normalize_phone
+from apps.employees.privacy import (
+    decrypt_value,
+    encrypt_value,
+    lookup_hmac,
+    normalize_document_number,
+    normalize_email,
+    normalize_phone,
+)
 from apps.employees.services import MergeConflict, merge_people, resolve_canonical_person
+
+
+PROFILE_FORBIDDEN_FIELDS = (
+    "funnel_stage",
+    "funnel_stage_changed_at",
+    "completed_shifts_count",
+    "first_booked_at",
+    "first_shift_completed_at",
+    "fifth_shift_completed_at",
+)
+WORK_PERIOD_WINDOW = timedelta(days=90)
 
 
 class ApiProblem(Exception):
@@ -83,6 +98,18 @@ def _required_string(payload: dict, field: str, maximum: int, *, minimum: int = 
     if not minimum <= len(value) <= maximum:
         raise ApiProblem(422, "validation_error", f"{field} length must be between {minimum} and {maximum}")
     return value
+
+
+def _optional_string(payload: dict, field: str, maximum: int) -> str | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiProblem(422, "validation_error", f"{field} must be a string")
+    value = value.strip()
+    if len(value) > maximum:
+        raise ApiProblem(422, "validation_error", f"{field} length must be at most {maximum}")
+    return value or None
 
 
 def _date_time(value, field: str, *, nullable: bool = False) -> datetime | None:
@@ -158,6 +185,18 @@ def _person_or_404(person_id: int) -> Person:
     except Person.DoesNotExist as exc:
         raise ApiProblem(404, "person_not_found", "Person was not found") from exc
     return resolve_canonical_person(person)
+
+
+def _locked_person_or_404(person_id: int) -> Person:
+    try:
+        person = Person.objects.select_for_update().get(pk=person_id)
+    except Person.DoesNotExist as exc:
+        raise ApiProblem(404, "person_not_found", "Person was not found") from exc
+    return resolve_canonical_person(person)
+
+
+def _lock_existing_profile(person: Person) -> PerformerProfile | None:
+    return PerformerProfile.objects.select_for_update().filter(person=person).first()
 
 
 def _contact_payloads(person: Person, contacts: object) -> list[tuple[str, str]]:
@@ -290,196 +329,602 @@ def _iso(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if value else None
 
 
-@api_endpoint
-def create_employment_period(request: HttpRequest, person_id: int) -> JsonResponse:
-    _, error = authorize(request, administrator=True)
-    if error:
-        return error
-    payload = _body(request)
-    position_code = payload.get("position_code")
-    if position_code != "operator_software":
-        raise ApiProblem(422, "invalid_position_code", "position_code must be operator_software")
-    personnel_number = payload.get("personnel_number")
-    if personnel_number is not None and (not isinstance(personnel_number, str) or len(personnel_number) > 250):
-        raise ApiProblem(422, "validation_error", "personnel_number must be null or a string up to 250 characters")
-    starts_at = _date_time(payload.get("starts_at"), "starts_at")
-
-    def operation():
-        try:
-            person = Person.objects.select_for_update().get(pk=person_id)
-        except Person.DoesNotExist as exc:
-            raise ApiProblem(404, "person_not_found", "Person was not found") from exc
-        person = resolve_canonical_person(person)
-        if person.merged_into_id:
-            raise ApiProblem(409, "person_already_merged", "Employment must reference the canonical Person")
-        if EmploymentEpisode.objects.filter(person=person, status=EmploymentEpisode.STATUS_ACTIVE).exists():
-            raise ApiProblem(409, "active_employment_exists", "Person already has an active employment episode")
-        episode = EmploymentEpisode.objects.create(
-            person=person,
-            personnel_number=personnel_number or None,
-            status=EmploymentEpisode.STATUS_ACTIVE,
-            starts_at=starts_at,
-            source="hr",
-        )
-        assignment = PositionAssignment.objects.create(
-            employment_episode=episode,
-            position_code=position_code,
-            status=PositionAssignment.STATUS_ACTIVE,
-            starts_at=starts_at,
-        )
-        enqueue_employment_changed(person, episode.pk, episode.status, assignment.pk, assignment.position_code, starts_at)
-        return ({
-            "employment_episode_id": str(episode.pk), "person_id": str(person.pk),
-            "employment_status": episode.status, "position_assignment_id": str(assignment.pk),
-            "position_code": assignment.position_code, "starts_at": _iso(episode.starts_at), "ends_at": None,
-        }, 201)
-
-    return _idempotent(request, f"person:{person_id}:employment:create", payload, operation)
+def _primary_contact(person: Person, contact_type: str) -> str | None:
+    contact = person.contacts.filter(
+        contact_type=contact_type,
+        is_primary=True,
+        status=PersonContact.STATUS_ACTIVE,
+        verification_status=PersonContact.VERIFICATION_VERIFIED,
+    ).first()
+    return decrypt_value(contact.encrypted_value) if contact else None
 
 
-@api_endpoint
-def terminate_employment(request: HttpRequest, employment_episode_id: int) -> JsonResponse:
-    _, error = authorize(request, administrator=True)
-    if error:
-        return error
-    payload = _body(request)
-    effective_at = _date_time(payload.get("effective_at"), "effective_at")
-    reason = _required_string(payload, "reason", 255)
-    idem_payload = {**payload, "effective_at": _iso(effective_at)}
-
-    def operation():
-        try:
-            episode = EmploymentEpisode.objects.select_for_update().select_related("person").get(pk=employment_episode_id)
-        except EmploymentEpisode.DoesNotExist as exc:
-            raise ApiProblem(404, "employment_episode_not_found", "Employment episode was not found") from exc
-        if episode.status == EmploymentEpisode.STATUS_TERMINATED:
-            if episode.ends_at == effective_at and episode.termination_reason == reason:
-                return ({
-                    "employment_episode_id": str(episode.pk), "person_id": str(episode.person_id),
-                    "employment_status": episode.status, "ended_at": _iso(episode.ends_at),
-                    "position_assignment_id": str(episode.positions.order_by("-starts_at").values_list("id", flat=True).first()) if episode.positions.exists() else None,
-                }, 200)
-            raise ApiProblem(409, "employment_period_conflict", "Employment episode is already terminated at a different time")
-        if effective_at <= episode.starts_at:
-            raise ApiProblem(422, "invalid_period", "effective_at must be later than starts_at")
-        episode.status = EmploymentEpisode.STATUS_TERMINATED
-        episode.ends_at = effective_at
-        episode.termination_reason = reason
-        episode.save(update_fields=("status", "ends_at", "termination_reason", "updated_at"))
-        assignments = episode.positions.filter(status=PositionAssignment.STATUS_ACTIVE).order_by("-starts_at")
-        assignment = assignments.first()
-        if assignment:
-            assignments.update(status=PositionAssignment.STATUS_ENDED, ends_at=effective_at, updated_at=django_timezone.now())
-        enqueue_employment_changed(
-            episode.person, episode.pk, episode.status, assignment.pk if assignment else None,
-            assignment.position_code if assignment else None, effective_at,
-        )
-        return ({
-            "employment_episode_id": str(episode.pk), "person_id": str(episode.person_id),
-            "employment_status": episode.status, "ended_at": _iso(effective_at),
-            "position_assignment_id": str(assignment.pk) if assignment else None,
-        }, 200)
-
-    return _idempotent(request, f"employment:{employment_episode_id}:terminate", idem_payload, operation)
-
-
-@api_endpoint
-def create_external_membership(request: HttpRequest, person_id: int) -> JsonResponse:
-    _, error = authorize(request, administrator=True)
-    if error:
-        return error
-    payload = _body(request)
-    try:
-        organization_id = str(UUID(payload.get("organization_id", "")))
-    except (ValueError, TypeError, AttributeError) as exc:
-        raise ApiProblem(422, "validation_error", "organization_id must be a UUID") from exc
-    valid_from = _date_time(payload.get("valid_from"), "valid_from")
-
-    def operation():
-        try:
-            person = Person.objects.select_for_update().get(pk=person_id)
-        except Person.DoesNotExist as exc:
-            raise ApiProblem(404, "person_not_found", "Person was not found") from exc
-        person = resolve_canonical_person(person)
-        if ExternalMembership.objects.filter(person=person, organization_id=organization_id, status=ExternalMembership.STATUS_ACTIVE).exists():
-            raise ApiProblem(409, "external_membership_already_active", "Person already has active membership in this organization")
-        membership = ExternalMembership.objects.create(
-            person=person, organization_id=organization_id, status=ExternalMembership.STATUS_ACTIVE, valid_from=valid_from
-        )
-        enqueue_membership_changed(person, membership, membership.status, valid_from)
-        return ({
-            "membership_id": str(membership.pk), "person_id": str(person.pk), "organization_id": organization_id,
-            "membership_status": membership.status, "valid_from": _iso(membership.valid_from), "valid_to": None,
-        }, 201)
-
-    return _idempotent(request, f"person:{person_id}:external-membership:create", payload, operation)
-
-
-@api_endpoint
-def revoke_external_membership(request: HttpRequest, membership_id: int) -> JsonResponse:
-    _, error = authorize(request, administrator=True)
-    if error:
-        return error
-    payload = _body(request)
-    effective_at = _date_time(payload.get("effective_at"), "effective_at")
-    reason = _required_string(payload, "reason", 255)
-    idem_payload = {**payload, "effective_at": _iso(effective_at)}
-
-    def operation():
-        try:
-            membership = ExternalMembership.objects.select_for_update().select_related("person").get(pk=membership_id)
-        except ExternalMembership.DoesNotExist as exc:
-            raise ApiProblem(404, "external_membership_not_found", "External membership was not found") from exc
-        if membership.status == ExternalMembership.STATUS_REVOKED:
-            if membership.valid_to == effective_at and membership.revoked_reason == reason:
-                return _membership_response(membership), 200
-            raise ApiProblem(409, "external_membership_conflict", "Membership was already revoked with different data")
-        if effective_at <= membership.valid_from:
-            raise ApiProblem(422, "invalid_period", "effective_at must be later than valid_from")
-        membership.status = ExternalMembership.STATUS_REVOKED
-        membership.valid_to = effective_at
-        membership.revoked_reason = reason
-        membership.revoked_at = django_timezone.now()
-        membership.save(update_fields=("status", "valid_to", "revoked_reason", "revoked_at"))
-        enqueue_membership_changed(membership.person, membership, membership.status, effective_at)
-        return _membership_response(membership), 200
-
-    return _idempotent(request, f"membership:{membership_id}:revoke", idem_payload, operation)
-
-
-def _membership_response(membership: ExternalMembership) -> dict:
+def _work_period_response(period: PerformerWorkPeriod) -> dict:
     return {
-        "membership_id": str(membership.pk), "person_id": str(membership.person_id),
-        "organization_id": membership.organization_id, "membership_status": membership.status,
-        "valid_from": _iso(membership.valid_from), "valid_to": _iso(membership.valid_to),
+        "work_period_id": str(period.pk),
+        "person_id": str(period.person_id),
+        "status": period.status,
+        "engagement_type": period.engagement_type,
+        "starts_at": _iso(period.starts_at),
+        "ends_at": _iso(period.ends_at),
+        "personnel_number": period.personnel_number or None,
+        "created_at": _iso(period.created_at),
+    }
+
+
+def _address_response(person_address: PersonAddress) -> dict:
+    address = person_address.address
+    location = address.location
+    return {
+        "person_address_id": str(person_address.pk),
+        "person_id": str(person_address.person_id),
+        "address_type": person_address.address_type,
+        "is_primary": person_address.is_primary,
+        "country_code": address.country_code,
+        "region": address.region or None,
+        "city": address.city or None,
+        "street": address.street or None,
+        "house": address.house or None,
+        "block": address.block or None,
+        "flat": address.flat or None,
+        "postal_code": address.postal_code or None,
+        "lat": location.y if location else None,
+        "lon": location.x if location else None,
+        "created_at": _iso(person_address.created_at),
+    }
+
+
+def _document_summary(document: PersonDocument) -> dict:
+    return {
+        "document_id": str(document.pk),
+        "document_type": document.document_type,
+        "passport_kind": document.passport_kind,
+        "issuing_country_code": document.issuing_country_code,
+        "verification_status": document.verification_status,
+        "status": document.status,
+        "issued_at": document.issued_at.isoformat(),
+        "valid_from": document.valid_from.isoformat() if document.valid_from else None,
+        "valid_to": document.valid_to.isoformat() if document.valid_to else None,
+        "is_primary": document.is_primary,
+    }
+
+
+def _identifier_summary(identifier: PersonIdentifier) -> dict:
+    return {
+        "identifier_id": str(identifier.pk),
+        "identifier_type": identifier.identifier_type,
+        "country_code": identifier.country_code,
+        "verification_status": identifier.verification_status,
+        "status": identifier.status,
+        "verified_at": _iso(identifier.verified_at),
+        "created_at": _iso(identifier.created_at),
+    }
+
+
+def _addresses_for(person: Person) -> list[PersonAddress]:
+    addresses = list(
+        PersonAddress.objects.filter(person=person).select_related("address").order_by("created_at", "id")
+    )
+    return sorted(
+        addresses,
+        key=lambda item: (
+            0 if item.address_type == PersonAddress.TYPE_REGISTRATION else 1 if item.is_primary else 2,
+            item.created_at,
+            item.pk,
+        ),
+    )
+
+
+def _profile_response(person: Person, profile: PerformerProfile) -> dict:
+    work_periods = PerformerWorkPeriod.objects.filter(person=person).order_by("starts_at", "id")
+    documents = PersonDocument.objects.filter(
+        person=person,
+        document_type__in=(PersonDocument.DOC_PASSPORT, PersonDocument.DOC_NAME_CHANGE),
+    ).order_by("issued_at", "id")
+    identifiers = PersonIdentifier.objects.filter(person=person).order_by("created_at", "id")
+    return {
+        "person_id": str(person.pk),
+        "display_name": person.display_name,
+        "profile_status": profile.status,
+        "engagement_type": profile.engagement_type,
+        "engagement_type_validation_status": profile.engagement_type_validation_status,
+        "engagement_type_selected_at": _iso(profile.engagement_type_selected_at),
+        "engagement_type_validated_at": _iso(profile.engagement_type_validated_at),
+        "engagement_type_validated_by_user_id": profile.engagement_type_validated_by_user_id,
+        "engagement_type_rejection_reason": profile.engagement_type_rejection_reason,
+        "medical_book_status": profile.medical_book_status,
+        "funnel_stage": profile.funnel_stage,
+        "funnel_stage_changed_at": _iso(profile.funnel_stage_changed_at),
+        "completed_shifts_count": profile.completed_shifts_count,
+        "first_booked_at": _iso(profile.first_booked_at),
+        "first_shift_completed_at": _iso(profile.first_shift_completed_at),
+        "fifth_shift_completed_at": _iso(profile.fifth_shift_completed_at),
+        "work_periods": [_work_period_response(period) for period in work_periods],
+        "addresses": [_address_response(item) for item in _addresses_for(person)],
+        "documents": [_document_summary(document) for document in documents],
+        "identifiers": [_identifier_summary(identifier) for identifier in identifiers],
+        "updated_at": _iso(profile.updated_at),
+    }
+
+
+def _profile_projection(person: Person, profile: PerformerProfile) -> tuple:
+    return (
+        profile.status,
+        profile.engagement_type,
+        profile.engagement_type_validation_status,
+        profile.medical_book_status,
+        profile.funnel_stage,
+        profile.completed_shifts_count,
+        person.display_name,
+        _primary_contact(person, PersonContact.TYPE_EMAIL),
+        _primary_contact(person, PersonContact.TYPE_PHONE),
+    )
+
+
+def _validate_profile_payload(payload: dict) -> tuple[str, str | None, str, str | None]:
+    for field in PROFILE_FORBIDDEN_FIELDS:
+        if field in payload:
+            raise ApiProblem(422, "validation_error", f"{field} is managed by the service and cannot be set")
+    profile_status = payload.get("profile_status")
+    if profile_status not in (PerformerProfile.STATUS_ACTIVE, PerformerProfile.STATUS_INACTIVE):
+        raise ApiProblem(422, "validation_error", "profile_status must be active or inactive")
+    engagement_type = payload.get("engagement_type")
+    if engagement_type is not None and engagement_type not in (
+        PerformerProfile.ENGAGEMENT_GPH,
+        PerformerProfile.ENGAGEMENT_SELF_EMPLOYED,
+    ):
+        raise ApiProblem(422, "invalid_engagement_type", "engagement_type must be gph or self_employed")
+    medical_book_status = payload.get("medical_book_status")
+    if medical_book_status is not None and medical_book_status not in (
+        PerformerProfile.MEDICAL_NONE,
+        PerformerProfile.MEDICAL_NON_FOOD,
+        PerformerProfile.MEDICAL_FOOD,
+    ):
+        raise ApiProblem(422, "invalid_medical_book_status", "medical_book_status is invalid")
+    change_reason = payload.get("change_reason")
+    if change_reason is not None and (not isinstance(change_reason, str) or len(change_reason) > 255):
+        raise ApiProblem(422, "validation_error", "change_reason must be a string up to 255 characters")
+    return profile_status, engagement_type, medical_book_status, change_reason
+
+
+def _locked_person_and_profile(person_id: int):
+    try:
+        person = Person.objects.select_for_update().get(pk=person_id)
+    except Person.DoesNotExist as exc:
+        raise ApiProblem(404, "person_not_found", "Person was not found") from exc
+    if person.merged_into_id:
+        raise ApiProblem(409, "person_already_merged", "Performer profile must reference the canonical Person")
+    profile = PerformerProfile.objects.select_for_update().filter(person=person).first()
+    return person, profile
+
+
+@api_endpoint
+def performer_profile(request: HttpRequest, person_id: int) -> JsonResponse:
+    if request.method == "GET":
+        return _get_performer_profile(request, person_id)
+    if request.method == "PUT":
+        return _put_performer_profile(request, person_id)
+    return _error(405, "method_not_allowed", "Only GET and PUT are supported")
+
+
+def _get_performer_profile(request: HttpRequest, person_id: int) -> JsonResponse:
+    _, error = authorize(request, scope="employees")
+    if error:
+        return error
+    try:
+        person = Person.objects.get(pk=person_id)
+    except Person.DoesNotExist as exc:
+        raise ApiProblem(404, "person_not_found", "Person was not found") from exc
+    if person.merged_into_id:
+        raise ApiProblem(404, "person_not_found", "Person was not found")
+    profile = PerformerProfile.objects.filter(person=person).first()
+    if profile is None:
+        raise ApiProblem(404, "performer_profile_not_found", "Performer profile was not found")
+    return JsonResponse(_profile_response(person, profile), json_dumps_params={"ensure_ascii": False})
+
+
+def _put_performer_profile(request: HttpRequest, person_id: int) -> JsonResponse:
+    principal, error = authorize(request, scope="employees")
+    if error:
+        return error
+    payload = _body(request)
+    profile_status, engagement_type, medical_book_status, change_reason = _validate_profile_payload(payload)
+
+    with transaction.atomic():
+        person, profile = _locked_person_and_profile(person_id)
+        created = profile is None
+        previous_projection = None
+        if created:
+            if engagement_type is None:
+                raise ApiProblem(422, "engagement_type_not_selected", "engagement_type is required when creating a profile")
+            now = django_timezone.now()
+            profile = PerformerProfile.objects.create(
+                person=person,
+                status=profile_status,
+                engagement_type=engagement_type,
+                engagement_type_validation_status=PerformerProfile.VALIDATION_PENDING,
+                engagement_type_selected_at=now,
+                medical_book_status=medical_book_status or PerformerProfile.MEDICAL_NONE,
+                funnel_stage=PerformerProfile.STAGE_PROFILE,
+                funnel_stage_changed_at=now,
+            )
+            PerformerEngagementTypeChange.objects.create(
+                person=person,
+                previous_engagement_type=None,
+                new_engagement_type=engagement_type,
+                previous_validation_status=None,
+                new_validation_status=PerformerProfile.VALIDATION_PENDING,
+                change_source=PerformerEngagementTypeChange.SOURCE_REGISTRATION,
+                changed_by_user_id=principal.get("user_id"),
+                reason=change_reason,
+            )
+        else:
+            previous_projection = _profile_projection(person, profile)
+            if engagement_type is not None and engagement_type != profile.engagement_type:
+                PerformerEngagementTypeChange.objects.create(
+                    person=person,
+                    previous_engagement_type=profile.engagement_type,
+                    new_engagement_type=engagement_type,
+                    previous_validation_status=profile.engagement_type_validation_status,
+                    new_validation_status=PerformerProfile.VALIDATION_PENDING,
+                    change_source=PerformerEngagementTypeChange.SOURCE_PROFILE_UPDATE,
+                    changed_by_user_id=principal.get("user_id"),
+                    reason=change_reason,
+                )
+                profile.engagement_type = engagement_type
+                profile.engagement_type_validation_status = PerformerProfile.VALIDATION_PENDING
+                profile.engagement_type_selected_at = django_timezone.now()
+                profile.engagement_type_validated_at = None
+                profile.engagement_type_validated_by_user_id = None
+                profile.engagement_type_rejection_reason = None
+            elif (
+                engagement_type is not None
+                and engagement_type == profile.engagement_type
+                and profile.engagement_type_validation_status == PerformerProfile.VALIDATION_REJECTED
+            ):
+                raise ApiProblem(409, "engagement_type_rejected", "Rejected engagement type must be changed before retry")
+            profile.status = profile_status
+            if medical_book_status is not None:
+                profile.medical_book_status = medical_book_status
+            profile.save(
+                update_fields=(
+                    "status",
+                    "engagement_type",
+                    "engagement_type_validation_status",
+                    "engagement_type_selected_at",
+                    "engagement_type_validated_at",
+                    "engagement_type_validated_by_user_id",
+                    "engagement_type_rejection_reason",
+                    "medical_book_status",
+                    "updated_at",
+                )
+            )
+
+        recompute_funnel_stage(person.pk, enqueue=False)
+        profile.refresh_from_db()
+        if created or previous_projection != _profile_projection(person, profile):
+            enqueue_performer_profile_changed(person)
+        response = _profile_response(person, profile)
+    return JsonResponse(response, status=201 if created else 200, json_dumps_params={"ensure_ascii": False})
+
+
+@api_endpoint
+def verify_engagement_type(request: HttpRequest, person_id: int) -> JsonResponse:
+    principal, error = authorize(request, administrator=True)
+    if error:
+        return error
+    payload = _body(request)
+    decision = payload.get("decision")
+    if decision not in (PerformerProfile.VALIDATION_VERIFIED, PerformerProfile.VALIDATION_REJECTED):
+        raise ApiProblem(422, "validation_error", "decision must be verified or rejected")
+    reason = _required_string(payload, "reason", 255)
+
+    with transaction.atomic():
+        person, profile = _locked_person_and_profile(person_id)
+        if profile is None:
+            raise ApiProblem(404, "performer_profile_not_found", "Performer profile was not found")
+        if not profile.engagement_type:
+            raise ApiProblem(422, "engagement_type_not_selected", "Engagement type must be selected first")
+        if profile.engagement_type_validation_status in (
+            PerformerProfile.VALIDATION_VERIFIED,
+            PerformerProfile.VALIDATION_REJECTED,
+        ):
+            if profile.engagement_type_validation_status == decision:
+                return JsonResponse(_engagement_verification_response(person, profile), json_dumps_params={"ensure_ascii": False})
+            raise ApiProblem(409, "engagement_type_already_validated", "Engagement type already has a different decision")
+        profile.engagement_type_validation_status = decision
+        profile.engagement_type_validated_at = django_timezone.now()
+        profile.engagement_type_validated_by_user_id = principal.get("user_id")
+        if decision == PerformerProfile.VALIDATION_REJECTED:
+            profile.engagement_type_rejection_reason = reason
+        else:
+            profile.engagement_type_rejection_reason = None
+        profile.save(
+            update_fields=(
+                "engagement_type_validation_status",
+                "engagement_type_validated_at",
+                "engagement_type_validated_by_user_id",
+                "engagement_type_rejection_reason",
+                "updated_at",
+            )
+        )
+        recompute_funnel_stage(person.pk, enqueue=False)
+        profile.refresh_from_db()
+        enqueue_performer_profile_changed(person)
+    return JsonResponse(_engagement_verification_response(person, profile), json_dumps_params={"ensure_ascii": False})
+
+
+def _engagement_verification_response(person: Person, profile: PerformerProfile) -> dict:
+    return {
+        "person_id": str(person.pk),
+        "engagement_type": profile.engagement_type,
+        "engagement_type_validation_status": profile.engagement_type_validation_status,
+        "engagement_type_validated_at": _iso(profile.engagement_type_validated_at),
+        "engagement_type_validated_by_user_id": profile.engagement_type_validated_by_user_id,
+        "engagement_type_rejection_reason": profile.engagement_type_rejection_reason,
+        "funnel_stage": profile.funnel_stage,
     }
 
 
 @api_endpoint
-def set_performer_profile(request: HttpRequest, person_id: int) -> JsonResponse:
+def create_work_period(request: HttpRequest, person_id: int) -> JsonResponse:
+    _, error = authorize(request, administrator=True)
+    if error:
+        return error
+    payload = _body(request)
+    starts_at = _date_time(payload.get("starts_at"), "starts_at")
+    engagement_type = payload.get("engagement_type")
+    if engagement_type not in (PerformerProfile.ENGAGEMENT_GPH, PerformerProfile.ENGAGEMENT_SELF_EMPLOYED):
+        raise ApiProblem(422, "invalid_engagement_type", "engagement_type must be gph or self_employed")
+    personnel_number = _optional_string(payload, "personnel_number", 250)
+    _required_string(payload, "reason", 255)
+    now = django_timezone.now()
+    if starts_at < now - WORK_PERIOD_WINDOW or starts_at > now + WORK_PERIOD_WINDOW:
+        raise ApiProblem(422, "validation_error", "starts_at must be within 90 days in the past or future")
+
+    with transaction.atomic():
+        person, profile = _locked_person_and_profile(person_id)
+        if profile is None:
+            raise ApiProblem(409, "performer_profile_required", "Performer profile is required before a work period")
+        if engagement_type != profile.engagement_type:
+            raise ApiProblem(422, "engagement_type_mismatch", "Work period engagement_type must match the profile")
+        if PerformerWorkPeriod.objects.filter(person=person, status=PerformerWorkPeriod.STATUS_ACTIVE).exists():
+            raise ApiProblem(409, "active_work_period_exists", "Person already has an active work period")
+        if personnel_number and PerformerWorkPeriod.objects.filter(personnel_number=personnel_number).exists():
+            raise ApiProblem(409, "work_period_conflict", "personnel_number is already used")
+        period = PerformerWorkPeriod.objects.create(
+            person=person,
+            engagement_type=engagement_type,
+            personnel_number=personnel_number,
+            status=PerformerWorkPeriod.STATUS_ACTIVE,
+            starts_at=starts_at,
+            source="hr",
+        )
+        recompute_funnel_stage(person.pk, enqueue=True)
+        response = _work_period_response(period)
+    return JsonResponse(response, status=201, json_dumps_params={"ensure_ascii": False})
+
+
+@api_endpoint
+def terminate_work_period(request: HttpRequest, work_period_id: int) -> JsonResponse:
+    _, error = authorize(request, administrator=True)
+    if error:
+        return error
+    payload = _body(request)
+    effective_at = _date_time(payload.get("effective_at"), "effective_at")
+    reason = _required_string(payload, "reason", 255)
+
+    with transaction.atomic():
+        period = (
+            PerformerWorkPeriod.objects.select_related("person")
+            .filter(pk=work_period_id)
+            .first()
+        )
+        if period is None:
+            raise ApiProblem(404, "work_period_not_found", "Work period was not found")
+        period_person = Person.objects.select_for_update().get(pk=period.person_id)
+        _lock_existing_profile(period_person)
+        period = PerformerWorkPeriod.objects.select_for_update().select_related("person").get(pk=work_period_id)
+        if period.status == PerformerWorkPeriod.STATUS_TERMINATED:
+            if period.ends_at == effective_at and period.termination_reason == reason:
+                stage = recompute_funnel_stage(period.person_id, enqueue=True)
+                return JsonResponse(
+                    {
+                        "work_period_id": str(period.pk),
+                        "status": period.status,
+                        "ends_at": _iso(period.ends_at),
+                        "funnel_stage": stage,
+                    },
+                    json_dumps_params={"ensure_ascii": False},
+                )
+            raise ApiProblem(409, "work_period_conflict", "Work period is already terminated with different data")
+        if effective_at <= period.starts_at:
+            raise ApiProblem(422, "validation_error", "effective_at must be later than starts_at")
+        period.status = PerformerWorkPeriod.STATUS_TERMINATED
+        period.ends_at = effective_at
+        period.termination_reason = reason
+        period.save(update_fields=("status", "ends_at", "termination_reason", "updated_at"))
+        stage = recompute_funnel_stage(period.person_id, enqueue=True)
+    return JsonResponse(
+        {
+            "work_period_id": str(period.pk),
+            "status": period.status,
+            "ends_at": _iso(period.ends_at),
+            "funnel_stage": stage,
+        },
+        json_dumps_params={"ensure_ascii": False},
+    )
+
+
+def _address_text(payload: dict, field: str, maximum: int, *, required: bool) -> str | None:
+    if required:
+        return _required_string(payload, field, maximum)
+    return _optional_string(payload, field, maximum)
+
+
+def _coordinates(payload: dict) -> tuple[float | None, float | None]:
+    lat = payload.get("lat")
+    lon = payload.get("lon")
+    if (lat is None) != (lon is None):
+        raise ApiProblem(422, "validation_error", "lat and lon must be provided together")
+    if lat is None:
+        return None, None
+    if isinstance(lat, bool) or isinstance(lon, bool) or not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        raise ApiProblem(422, "validation_error", "lat and lon must be numbers")
+    if not -90 <= lat <= 90:
+        raise ApiProblem(422, "validation_error", "lat must be between -90 and 90")
+    if not -180 <= lon <= 180:
+        raise ApiProblem(422, "validation_error", "lon must be between -180 and 180")
+    return float(lat), float(lon)
+
+
+@api_endpoint
+def person_addresses(request: HttpRequest, person_id: int) -> JsonResponse:
+    if request.method == "GET":
+        _, error = authorize(request, scope="employees")
+        if error:
+            return error
+        person = _person_or_404(person_id)
+        if person.merged_into_id:
+            raise ApiProblem(404, "person_not_found", "Person was not found")
+        return JsonResponse(
+            [_address_response(item) for item in _addresses_for(person)],
+            safe=False,
+            json_dumps_params={"ensure_ascii": False},
+        )
+    if request.method == "POST":
+        return _create_person_address(request, person_id)
+    return _error(405, "method_not_allowed", "Only GET and POST are supported")
+
+
+def _create_person_address(request: HttpRequest, person_id: int) -> JsonResponse:
     _, error = authorize(request, scope="employees")
     if error:
         return error
     payload = _body(request)
-    profile_status = payload.get("profile_status")
-    if profile_status not in (PerformerProfile.STATUS_ACTIVE, PerformerProfile.STATUS_INACTIVE):
-        raise ApiProblem(422, "validation_error", "profile_status must be active or inactive")
+    address_type = payload.get("address_type")
+    if address_type not in (PersonAddress.TYPE_REGISTRATION, PersonAddress.TYPE_WORK_SEARCH):
+        raise ApiProblem(422, "invalid_address_type", "address_type must be registration or work_search")
+    is_primary = payload.get("is_primary", False)
+    if not isinstance(is_primary, bool):
+        raise ApiProblem(422, "validation_error", "is_primary must be boolean")
+    if address_type == PersonAddress.TYPE_REGISTRATION and is_primary:
+        raise ApiProblem(422, "invalid_address_type", "Registration address cannot be primary")
+
+    country_code = payload.get("country_code")
+    if not isinstance(country_code, str) or not re.fullmatch(r"[A-Za-z]{2}", country_code):
+        raise ApiProblem(422, "validation_error", "country_code must be ISO 3166-1 alpha-2")
+    country_code = country_code.upper()
+    country = _optional_string(payload, "country", 250) or country_code
+    region = _address_text(payload, "region", 250, required=True)
+    city = _address_text(payload, "city", 250, required=True)
+    street = _address_text(payload, "street", 250, required=False)
+    house = _address_text(payload, "house", 250, required=False)
+    block = _address_text(payload, "block", 250, required=False)
+    flat = _address_text(payload, "flat", 250, required=False)
+    postal_code = _address_text(payload, "postal_code", 32, required=False)
+    lat, lon = _coordinates(payload)
+
     with transaction.atomic():
         try:
             person = Person.objects.select_for_update().get(pk=person_id)
         except Person.DoesNotExist as exc:
             raise ApiProblem(404, "person_not_found", "Person was not found") from exc
-        person = resolve_canonical_person(person)
         if person.merged_into_id:
-            raise ApiProblem(409, "person_already_merged", "Performer profile must reference canonical Person")
-        profile, created = PerformerProfile.objects.get_or_create(person=person, defaults={"status": profile_status})
-        changed = created or profile.status != profile_status
-        if not created and changed:
-            profile.status = profile_status
-            profile.save(update_fields=("status", "updated_at"))
-        if changed:
-            enqueue_performer_profile_changed(person)
-    return JsonResponse(_performer_response(person, profile), status=201 if created else 200, json_dumps_params={"ensure_ascii": False})
+            raise ApiProblem(409, "person_already_merged", "Address must reference the canonical Person")
+
+        if address_type == PersonAddress.TYPE_REGISTRATION and PersonAddress.objects.filter(
+            person=person, address_type=PersonAddress.TYPE_REGISTRATION
+        ).exists():
+            raise ApiProblem(409, "registration_address_exists", "Person already has a registration address")
+
+        make_primary = is_primary
+        if address_type == PersonAddress.TYPE_WORK_SEARCH:
+            has_primary = PersonAddress.objects.filter(
+                person=person, address_type=PersonAddress.TYPE_WORK_SEARCH, is_primary=True
+            ).exists()
+            if is_primary and has_primary:
+                raise ApiProblem(409, "primary_work_address_exists", "Person already has a primary work search address")
+            make_primary = is_primary or not has_primary
+
+        full_address = ", ".join(
+            part for part in (postal_code, country, region, city, street, house, block, flat) if part
+        )
+        address = Address.objects.create(
+            full_address=full_address,
+            postal_code=postal_code or "",
+            country_code=country_code,
+            country=country,
+            region=region or "",
+            city=city or "",
+            street=street or "",
+            house=house or "",
+            block=block or "",
+            flat=flat or "",
+            main_address=make_primary,
+            location=Point(lon, lat, srid=4326) if lat is not None else None,
+        )
+        person_address = PersonAddress.objects.create(
+            person=person,
+            address=address,
+            address_type=address_type,
+            is_primary=make_primary,
+        )
+        response = _address_response(person_address)
+    return JsonResponse(response, status=201, json_dumps_params={"ensure_ascii": False})
+
+
+@api_endpoint
+def set_primary_address(request: HttpRequest, person_id: int, address_id: int) -> JsonResponse:
+    _, error = authorize(request, scope="employees")
+    if error:
+        return error
+    payload = _body(request)
+    is_primary = payload.get("is_primary")
+    if not isinstance(is_primary, bool):
+        raise ApiProblem(422, "validation_error", "is_primary must be boolean")
+
+    with transaction.atomic():
+        person = _locked_person_or_404(person_id)
+        _lock_existing_profile(person)
+        person_address = (
+            PersonAddress.objects.select_for_update()
+            .select_related("address")
+            .filter(pk=address_id, person=person)
+            .first()
+        )
+        if person_address is None:
+            raise ApiProblem(404, "person_address_not_found", "Person address was not found")
+        if person_address.address_type != PersonAddress.TYPE_WORK_SEARCH:
+            raise ApiProblem(422, "invalid_address_type", "Only work search addresses can be switched")
+
+        if is_primary:
+            for other in PersonAddress.objects.select_for_update().filter(
+                person=person,
+                address_type=PersonAddress.TYPE_WORK_SEARCH,
+                is_primary=True,
+            ).exclude(pk=person_address.pk):
+                other.is_primary = False
+                other.save(update_fields=("is_primary", "updated_at"))
+                if other.address.main_address:
+                    other.address.main_address = False
+                    other.address.save(update_fields=("main_address",))
+            if not person_address.is_primary:
+                person_address.is_primary = True
+                person_address.save(update_fields=("is_primary", "updated_at"))
+            if not person_address.address.main_address:
+                person_address.address.main_address = True
+                person_address.address.save(update_fields=("main_address",))
+        else:
+            if person_address.is_primary:
+                person_address.is_primary = False
+                person_address.save(update_fields=("is_primary", "updated_at"))
+            if person_address.address.main_address:
+                person_address.address.main_address = False
+                person_address.address.save(update_fields=("main_address",))
+
+        response = _address_response(person_address)
+    return JsonResponse(response, json_dumps_params={"ensure_ascii": False})
 
 
 @api_endpoint
@@ -523,7 +968,8 @@ def create_person_document(request: HttpRequest, person_id: int) -> JsonResponse
     fingerprint = lookup_hmac(f"document:{country_code}:{document_type}", normalized) if document_type == PersonDocument.DOC_PASSPORT else None
 
     def operation():
-        person = _person_or_404(person_id)
+        person = _locked_person_or_404(person_id)
+        _lock_existing_profile(person)
         document = PersonDocument.objects.create(
             person=person,
             document_type=document_type,
@@ -538,6 +984,7 @@ def create_person_document(request: HttpRequest, person_id: int) -> JsonResponse
             valid_to=valid_to,
             is_primary=is_primary if document_type == PersonDocument.DOC_PASSPORT else False,
         )
+        recompute_funnel_stage(person.pk, enqueue=True)
         return (_document_response(document), 201)
 
     return _idempotent(request, f"person:{person_id}:document:create", payload, operation)
@@ -570,12 +1017,14 @@ def verify_person_document(request: HttpRequest, person_id: int, document_id: in
         raise ApiProblem(422, "invalid_document", "decision must be verified or rejected")
     reason = _required_string(payload, "reason", 255)
     with transaction.atomic():
-        person = _person_or_404(person_id)
+        person = _locked_person_or_404(person_id)
+        _lock_existing_profile(person)
         try:
             document = PersonDocument.objects.select_for_update().get(pk=document_id, person=person)
         except PersonDocument.DoesNotExist as exc:
             raise ApiProblem(404, "person_document_not_found", "Document was not found") from exc
         if document.verification_status == decision:
+            recompute_funnel_stage(person.pk, enqueue=True)
             return JsonResponse(_document_verification_response(document, principal), status=200)
         if document.verification_status != PersonDocument.VERIFY_PENDING:
             raise ApiProblem(409, "document_not_verified", "Document has already received a verification decision")
@@ -610,6 +1059,7 @@ def verify_person_document(request: HttpRequest, person_id: int, document_id: in
         ):
             person.identity_status = Person.IDENTITY_VERIFIED
             person.save(update_fields=("identity_status",))
+        recompute_funnel_stage(person.pk, enqueue=True)
         return JsonResponse(_document_verification_response(document, principal), status=200)
 
 
@@ -643,7 +1093,8 @@ def create_person_identifier(request: HttpRequest, person_id: int) -> JsonRespon
     fingerprint = lookup_hmac(f"identifier:{country_code}:{identifier_type}", normalized)
 
     def operation():
-        person = _person_or_404(person_id)
+        person = _locked_person_or_404(person_id)
+        _lock_existing_profile(person)
         identifier = PersonIdentifier.objects.create(
             person=person,
             identifier_type=identifier_type,
@@ -653,6 +1104,7 @@ def create_person_identifier(request: HttpRequest, person_id: int) -> JsonRespon
             verification_status=PersonIdentifier.VERIFY_PENDING,
             status=PersonIdentifier.STATUS_ACTIVE,
         )
+        recompute_funnel_stage(person.pk, enqueue=True)
         return (_identifier_response(identifier), 201)
 
     return _idempotent(request, f"person:{person_id}:identifier:create", payload, operation)
@@ -685,13 +1137,15 @@ def verify_person_identifier(request: HttpRequest, person_id: int, identifier_id
     reason = _required_string(payload, "reason", 255)
 
     with transaction.atomic():
-        submitted_person = _person_or_404(person_id)
+        submitted_person = _locked_person_or_404(person_id)
+        _lock_existing_profile(submitted_person)
         try:
             identifier = PersonIdentifier.objects.select_for_update().get(pk=identifier_id, person=submitted_person)
         except PersonIdentifier.DoesNotExist as exc:
             raise ApiProblem(404, "person_identifier_not_found", "Identifier was not found") from exc
         if identifier.verification_status != PersonIdentifier.VERIFY_PENDING:
             if identifier.verification_status == decision:
+                recompute_funnel_stage(submitted_person.pk, enqueue=True)
                 return JsonResponse(_identifier_verification_response(identifier, submitted_person, principal, "new_identifier", None), status=200)
             raise ApiProblem(409, "identifier_identity_conflict", "Identifier already has a different verification decision")
 
@@ -704,6 +1158,7 @@ def verify_person_identifier(request: HttpRequest, person_id: int, identifier_id
             identifier.verification_source = verification_method
             identifier.revoked_at = now
             identifier.save(update_fields=("verification_status", "status", "verified_at", "verified_by_user_id", "verification_source", "revoked_at"))
+            recompute_funnel_stage(submitted_person.pk, enqueue=True)
             return JsonResponse(_identifier_verification_response(identifier, submitted_person, principal, "new_identifier", None), status=200)
 
         match = PersonIdentifier.objects.select_for_update().filter(
@@ -754,6 +1209,7 @@ def verify_person_identifier(request: HttpRequest, person_id: int, identifier_id
         if submitted_person.identity_status == Person.IDENTITY_PROVISIONAL:
             submitted_person.identity_status = Person.IDENTITY_VERIFIED
             submitted_person.save(update_fields=("identity_status",))
+        recompute_funnel_stage(submitted_person.pk, enqueue=True)
         return JsonResponse(_identifier_verification_response(identifier, submitted_person, principal, "new_identifier", None), status=200)
 
 
@@ -790,7 +1246,8 @@ def replace_person_document(request: HttpRequest, person_id: int, document_id: i
         raise ApiProblem(422, "invalid_document", "reason_code is invalid")
 
     with transaction.atomic():
-        person = _person_or_404(person_id)
+        person = _locked_person_or_404(person_id)
+        _lock_existing_profile(person)
         try:
             old_doc = PersonDocument.objects.select_for_update().get(pk=document_id, person=person, document_type=PersonDocument.DOC_PASSPORT)
             new_doc = PersonDocument.objects.select_for_update().get(pk=replacement_id, person=person, document_type=PersonDocument.DOC_PASSPORT)
@@ -811,6 +1268,7 @@ def replace_person_document(request: HttpRequest, person_id: int, document_id: i
         if was_primary:
             new_doc.is_primary = True
             new_doc.save(update_fields=("is_primary", "updated_at"))
+        recompute_funnel_stage(person.pk, enqueue=True)
         response_body = {
             "old_document_id": str(old_doc.pk), "replacement_document_id": str(new_doc.pk),
             "old_status": old_doc.status, "new_status": new_doc.status, "effective_at": _iso(effective_at),
@@ -841,7 +1299,8 @@ def change_legal_name(request: HttpRequest, person_id: int) -> JsonResponse:
         raise ApiProblem(422, "source_document_required", "A verified name-change document is required")
 
     def operation():
-        person = _person_or_404(person_id)
+        person = _locked_person_or_404(person_id)
+        _lock_existing_profile(person)
         source_document = None
         if source_document_id:
             try:
@@ -884,23 +1343,6 @@ def change_legal_name(request: HttpRequest, person_id: int) -> JsonResponse:
         }, 200)
 
     return _idempotent(request, f"person:{person_id}:legal-name-change", payload, operation)
-
-
-def _primary_contact(person: Person, contact_type: str) -> str | None:
-    contact = person.contacts.filter(
-        contact_type=contact_type,
-        is_primary=True,
-        status=PersonContact.STATUS_ACTIVE,
-        verification_status=PersonContact.VERIFICATION_VERIFIED,
-    ).first()
-    return decrypt_value(contact.encrypted_value) if contact else None
-
-
-def _performer_response(person: Person, profile: PerformerProfile) -> dict:
-    return {
-        "person_id": str(person.pk), "profile_status": profile.status, "display_name": person.display_name,
-        "email": _primary_contact(person, PersonContact.TYPE_EMAIL), "phone": _primary_contact(person, PersonContact.TYPE_PHONE),
-    }
 
 
 def _merge_response(duplicate: Person, canonical: Person, merged_at: datetime) -> dict:
@@ -968,6 +1410,6 @@ def merge_person_api(request: HttpRequest, duplicate_person_id: int) -> JsonResp
             raise ApiProblem(404, "person_not_found", "Person was not found") from exc
         except MergeConflict as exc:
             raise ApiProblem(409, "person_merge_conflict", str(exc)) from exc
-        return (_merge_response(Person.objects.get(pk=duplicate_person_id), canonical, merge_record.merged_at), 200 if not created else 200)
+        return (_merge_response(Person.objects.get(pk=duplicate_person_id), canonical, merge_record.merged_at), 200)
 
     return _idempotent(request, f"person:{duplicate_person_id}:merge", payload, operation)

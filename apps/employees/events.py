@@ -61,70 +61,44 @@ def enqueue_identity_changed(person: Person, effective_at=None) -> IntegrationOu
     )
 
 
-def enqueue_employment_changed(
-    person: Person,
-    episode_id: int,
-    employment_status: str,
-    position_assignment_id: int | None,
-    position_code: str | None,
-    effective_at,
-) -> IntegrationOutbox:
-    return _enqueue(
-        ACCESS_TOPIC,
-        person.pk,
-        "people.employment.changed",
-        {
-            "person_id": str(person.pk),
-            "employment_episode_id": str(episode_id),
-            "employment_status": employment_status,
-            "position_assignment_id": str(position_assignment_id) if position_assignment_id else None,
-            "position_code": position_code,
-            "effective_at": effective_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-        },
-    )
-
-
-def enqueue_membership_changed(person: Person, membership, status: str, effective_at) -> IntegrationOutbox:
-    return _enqueue(
-        ACCESS_TOPIC,
-        person.pk,
-        "people.external_membership.changed",
-        {
-            "person_id": str(person.pk),
-            "membership_id": str(membership.pk),
-            "organization_id": membership.organization_id,
-            "membership_status": status,
-            "effective_at": effective_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-        },
-    )
-
-
-def enqueue_performer_profile_changed(person: Person) -> IntegrationOutbox:
-    profile = getattr(person, "performer_profile", None)
-    if profile is None:
-        return None
-    contacts = list(
-        person.contacts.filter(status="active", verification_status="verified", is_primary=True)
-    )
+def _primary_contact_values(person: Person) -> tuple[str | None, str | None]:
     email = phone = None
+    contacts = person.contacts.filter(
+        status="active", verification_status="verified", is_primary=True
+    )
     for contact in contacts:
         value = decrypt_value(contact.encrypted_value)
         if contact.contact_type == "email":
             email = value
         elif contact.contact_type == "phone":
             phone = value
-    return _enqueue(
-        PERFORMER_TOPIC,
-        person.pk,
-        "people.performer_profile.changed",
-        {
-            "person_id": str(person.pk),
-            "profile_status": profile.status,
-            "display_name": person.display_name,
-            "email": email,
-            "phone": phone,
-        },
-    )
+    return email, phone
+
+
+def performer_profile_payload(person: Person) -> dict | None:
+    profile = getattr(person, "performer_profile", None)
+    if profile is None:
+        return None
+    email, phone = _primary_contact_values(person)
+    return {
+        "person_id": str(person.pk),
+        "profile_status": profile.status,
+        "engagement_type": profile.engagement_type,
+        "engagement_type_validation_status": profile.engagement_type_validation_status,
+        "medical_book_status": profile.medical_book_status,
+        "funnel_stage": profile.funnel_stage,
+        "completed_shifts_count": profile.completed_shifts_count,
+        "display_name": person.display_name,
+        "email": email,
+        "phone": phone,
+    }
+
+
+def enqueue_performer_profile_changed(person: Person) -> IntegrationOutbox | None:
+    payload = performer_profile_payload(person)
+    if payload is None:
+        return None
+    return _enqueue(PERFORMER_TOPIC, person.pk, "people.performer_profile.changed", payload)
 
 
 def enqueue_merge_events(duplicate: Person, canonical: Person, reason_code: str, merged_at) -> tuple[IntegrationOutbox, IntegrationOutbox]:

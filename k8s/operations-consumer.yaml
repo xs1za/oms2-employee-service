@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oms2-operations-consumer
+  namespace: oms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oms2-operations-consumer
+  template:
+    metadata:
+      labels:
+        app: oms2-operations-consumer
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: consumer
+          image: oms2:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "manage.py", "consume_operations_performer", "--poll-interval", "1"]
+          envFrom:
+            - configMapRef:
+                name: oms2-config
+            - secretRef:
+                name: oms2-secret
