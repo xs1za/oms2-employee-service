@@ -5,6 +5,8 @@ from django.conf import settings
 from django.db import connection
 from django.http import JsonResponse
 
+from apps.employees.privacy import check_privacy_keys
+
 
 def check_database() -> dict:
     try:
@@ -42,6 +44,7 @@ def ready(request):
     checks = {
         "database": check_database(),
         "kafka": check_tcp_endpoint(settings.KAFKA_BOOTSTRAP_SERVERS),
+        "personal_data_keys": check_privacy_keys(),
     }
     ready_status = "ok" if all(check["status"] == "ok" for check in checks.values()) else "failed"
     return JsonResponse(
