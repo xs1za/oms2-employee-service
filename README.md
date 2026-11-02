@@ -185,13 +185,13 @@ docker run --rm -p 8002:8000 -e SECRET_KEY=dev-secret -e DATABASE_URL=postgis://
 
 ```bash
 kubectl apply -f ../platform/k8s/namespace.yaml
-copy k8s\secret.example.yaml k8s\secret.yaml
 kubectl apply -f k8s/postgres.yaml
 kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secret.yaml
 kubectl apply -f k8s/deployment.yaml
 kubectl apply -f k8s/service.yaml
 ```
+
+Перед применением `deployment.yaml` создать `oms2-secret` из `.env.k8s.oms1` по инструкции `platform/docs/K8S_FULL_SETUP.md`.
 
 Для локального доступа:
 

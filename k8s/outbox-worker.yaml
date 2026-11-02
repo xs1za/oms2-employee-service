@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oms2-outbox-worker
+  namespace: oms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oms2-outbox-worker
+  template:
+    metadata:
+      labels:
+        app: oms2-outbox-worker
+    spec:
+      containers:
+        - name: worker
+          image: oms2:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "manage.py", "publish_people_outbox", "--poll-interval", "1"]
+          envFrom:
+            - configMapRef:
+                name: oms2-config
+            - secretRef:
+                name: oms2-secret
