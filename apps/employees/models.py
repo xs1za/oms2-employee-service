@@ -6,6 +6,7 @@ from django.db.models import Q
 class Address(models.Model):
     full_address = models.CharField(max_length=1000, null=False, verbose_name="Адрес полный")
     postal_code = models.CharField(max_length=32, blank=True, verbose_name="Почтовый индекс")
+    country_code = models.CharField(max_length=2, blank=True, null=True, verbose_name="Код страны")
     country = models.CharField(max_length=250, blank=True, verbose_name="Страна")
     federal_district = models.CharField(max_length=250, blank=True, verbose_name="Федеральный округ")
     region = models.CharField(max_length=250, blank=True, verbose_name="Регион")
@@ -43,7 +44,6 @@ class Person(models.Model):
     patronymic = models.CharField(max_length=50, blank=True, verbose_name="Отчество")
     gender = models.CharField(max_length=6, default="U", verbose_name="Пол")
     identity_status = models.CharField(max_length=16, choices=IDENTITY_CHOICES, default=IDENTITY_PROVISIONAL)
-    address = models.ForeignKey(Address, blank=True, null=True, on_delete=models.PROTECT, verbose_name="Адрес")
     merged_into = models.ForeignKey(
         "self", blank=True, null=True, on_delete=models.PROTECT, related_name="merged_people"
     )
@@ -73,8 +73,8 @@ class Person(models.Model):
 
     @property
     def personnel_number(self) -> str:
-        episode = self.employment_periods.filter(status=EmploymentEpisode.STATUS_ACTIVE).order_by("-starts_at").first()
-        return episode.personnel_number if episode and episode.personnel_number else ""
+        period = self.work_periods.filter(status=PerformerWorkPeriod.STATUS_ACTIVE).order_by("-starts_at").first()
+        return period.personnel_number if period and period.personnel_number else ""
 
 
 class PersonContact(models.Model):
@@ -125,12 +125,77 @@ class PersonContact(models.Model):
         ]
 
 
-class EmploymentEpisode(models.Model):
+class PerformerProfile(models.Model):
+    STATUS_ACTIVE = "active"
+    STATUS_INACTIVE = "inactive"
+    STATUS_CHOICES = ((STATUS_ACTIVE, "Активен"), (STATUS_INACTIVE, "Неактивен"))
+
+    ENGAGEMENT_GPH = "gph"
+    ENGAGEMENT_SELF_EMPLOYED = "self_employed"
+    ENGAGEMENT_CHOICES = ((ENGAGEMENT_GPH, "ГПХ"), (ENGAGEMENT_SELF_EMPLOYED, "Самозанятый"))
+
+    VALIDATION_PENDING = "pending"
+    VALIDATION_VERIFIED = "verified"
+    VALIDATION_REJECTED = "rejected"
+    VALIDATION_CHOICES = (
+        (VALIDATION_PENDING, "Ожидает проверки"),
+        (VALIDATION_VERIFIED, "Подтвержден"),
+        (VALIDATION_REJECTED, "Отклонен"),
+    )
+
+    MEDICAL_NONE = "none"
+    MEDICAL_NON_FOOD = "non_food"
+    MEDICAL_FOOD = "food"
+    MEDICAL_CHOICES = (
+        (MEDICAL_NONE, "Нет"),
+        (MEDICAL_NON_FOOD, "Непищевая"),
+        (MEDICAL_FOOD, "Пищевая"),
+    )
+
+    STAGE_BLANK = "PERFORMER_BLANK"
+    STAGE_PROFILE = "PERFORMER_PROFILE"
+    STAGE_PROFILE_DELETED = "PERFORMER_PROFILE_DELETED"
+    STAGE_DOCS_PENDING = "PERFORMER_DOCS_PENDING"
+    STAGE_READY_NON_MEDICAL = "PERFORMER_READY_NON_MEDICAL"
+    STAGE_READY_NON_FOOD = "PERFORMER_READY_NON_FOOD"
+    STAGE_READY_FOOD = "PERFORMER_READY_FOOD"
+    STAGE_BOOKED_SHIFT = "PERFORMER_BOOKED_SHIFT"
+    STAGE_FIRST_SHIFT_COMPLETED = "PERFORMER_FIRST_SHIFT_COMPLETED"
+    STAGE_FIFTH_SHIFT_COMPLETED = "PERFORMER_FIFTH_SHIFT_COMPLETED"
+
+    person = models.OneToOneField(Person, on_delete=models.PROTECT, related_name="performer_profile")
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
+    engagement_type = models.CharField(max_length=32, choices=ENGAGEMENT_CHOICES)
+    engagement_type_validation_status = models.CharField(
+        max_length=16, choices=VALIDATION_CHOICES, default=VALIDATION_PENDING
+    )
+    engagement_type_selected_at = models.DateTimeField()
+    engagement_type_validated_at = models.DateTimeField(null=True, blank=True)
+    engagement_type_validated_by_user_id = models.CharField(max_length=36, null=True, blank=True)
+    engagement_type_rejection_reason = models.CharField(max_length=255, null=True, blank=True)
+    medical_book_status = models.CharField(max_length=16, choices=MEDICAL_CHOICES, default=MEDICAL_NONE)
+    funnel_stage = models.CharField(max_length=40, default=STAGE_PROFILE)
+    funnel_stage_changed_at = models.DateTimeField()
+    completed_shifts_count = models.IntegerField(default=0)
+    first_booked_at = models.DateTimeField(null=True, blank=True)
+    first_shift_completed_at = models.DateTimeField(null=True, blank=True)
+    fifth_shift_completed_at = models.DateTimeField(null=True, blank=True)
+    source_version = models.BigIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(check=Q(completed_shifts_count__gte=0), name="performer_completed_shifts_non_negative_ck"),
+        ]
+
+
+class PerformerWorkPeriod(models.Model):
     STATUS_ACTIVE = "active"
     STATUS_TERMINATED = "terminated"
     STATUS_CHOICES = ((STATUS_ACTIVE, "Активен"), (STATUS_TERMINATED, "Завершен"))
 
-    person = models.ForeignKey(Person, on_delete=models.PROTECT, related_name="employment_periods")
+    person = models.ForeignKey(Person, on_delete=models.PROTECT, related_name="work_periods")
+    engagement_type = models.CharField(max_length=32, choices=PerformerProfile.ENGAGEMENT_CHOICES)
     personnel_number = models.CharField(max_length=250, blank=True, null=True)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
     starts_at = models.DateTimeField()
@@ -142,85 +207,129 @@ class EmploymentEpisode(models.Model):
 
     class Meta:
         ordering = ("person_id", "starts_at")
-        indexes = [models.Index(fields=("person", "status"), name="employment_person_status_idx")]
+        indexes = [models.Index(fields=("person", "status"), name="work_period_person_status_idx")]
         constraints = [
             models.UniqueConstraint(
-                fields=("person",), condition=Q(status="active"), name="uniq_active_employment_person"
+                fields=("person",), condition=Q(status="active"), name="uq_active_work_period_person"
             ),
             models.UniqueConstraint(
                 fields=("personnel_number",),
                 condition=Q(personnel_number__isnull=False),
-                name="uniq_employment_personnel_number",
+                name="uq_work_period_personnel_number",
             ),
             models.CheckConstraint(
                 check=Q(ends_at__isnull=True) | Q(ends_at__gt=models.F("starts_at")),
-                name="employment_period_interval_ck",
+                name="work_period_interval_ck",
             ),
         ]
 
 
-class PositionAssignment(models.Model):
-    STATUS_ACTIVE = "active"
-    STATUS_ENDED = "ended"
-    STATUS_CHOICES = ((STATUS_ACTIVE, "Активно"), (STATUS_ENDED, "Завершено"))
+class PersonAddress(models.Model):
+    TYPE_REGISTRATION = "registration"
+    TYPE_WORK_SEARCH = "work_search"
+    TYPE_CHOICES = ((TYPE_REGISTRATION, "Регистрация"), (TYPE_WORK_SEARCH, "Поиск подработки"))
 
-    employment_episode = models.ForeignKey(EmploymentEpisode, on_delete=models.PROTECT, related_name="positions")
-    position_code = models.CharField(max_length=64)
-    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
-    starts_at = models.DateTimeField()
-    ends_at = models.DateTimeField(null=True, blank=True)
+    person = models.ForeignKey(Person, on_delete=models.PROTECT, related_name="person_addresses")
+    address = models.ForeignKey(Address, on_delete=models.PROTECT, related_name="person_addresses")
+    address_type = models.CharField(max_length=16, choices=TYPE_CHOICES)
+    is_primary = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ("employment_episode_id", "starts_at")
-        indexes = [models.Index(fields=("employment_episode", "status"), name="position_episode_status_idx")]
+        ordering = ("person_id", "address_type", "created_at", "id")
+        indexes = [models.Index(fields=("person", "address_type"), name="person_address_type_idx")]
         constraints = [
-            models.CheckConstraint(
-                check=Q(ends_at__isnull=True) | Q(ends_at__gt=models.F("starts_at")),
-                name="position_assignment_interval_ck",
+            models.UniqueConstraint(
+                fields=("person",),
+                condition=Q(address_type="registration"),
+                name="uq_person_registration_address",
             ),
             models.UniqueConstraint(
-                fields=("employment_episode",), condition=Q(status="active"), name="uniq_active_position_assignment"
+                fields=("person",),
+                condition=Q(address_type="work_search", is_primary=True),
+                name="uq_person_primary_work_address",
+            ),
+            models.CheckConstraint(
+                check=Q(address_type="work_search") | Q(is_primary=False),
+                name="registration_address_not_primary_ck",
             ),
         ]
 
 
-class ExternalMembership(models.Model):
-    STATUS_ACTIVE = "active"
-    STATUS_REVOKED = "revoked"
+class PerformerEngagementTypeChange(models.Model):
+    SOURCE_REGISTRATION = "registration"
+    SOURCE_PROFILE_UPDATE = "profile_update"
+    SOURCE_MERGE = "merge"
+    SOURCE_CHOICES = (
+        (SOURCE_REGISTRATION, "Регистрация"),
+        (SOURCE_PROFILE_UPDATE, "Обновление профиля"),
+        (SOURCE_MERGE, "Объединение"),
+    )
 
-    person = models.ForeignKey(Person, on_delete=models.PROTECT, related_name="external_memberships")
-    organization_id = models.CharField(max_length=36)
-    status = models.CharField(max_length=16, choices=((STATUS_ACTIVE, "Активно"), (STATUS_REVOKED, "Отозвано")), default=STATUS_ACTIVE)
-    valid_from = models.DateTimeField()
-    valid_to = models.DateTimeField(null=True, blank=True)
-    revoked_reason = models.CharField(max_length=255, null=True, blank=True)
+    person = models.ForeignKey(Person, on_delete=models.PROTECT, related_name="engagement_type_changes")
+    previous_engagement_type = models.CharField(max_length=32, null=True, blank=True)
+    new_engagement_type = models.CharField(max_length=32)
+    previous_validation_status = models.CharField(max_length=16, null=True, blank=True)
+    new_validation_status = models.CharField(max_length=16)
+    change_source = models.CharField(max_length=32, choices=SOURCE_CHOICES, default=SOURCE_PROFILE_UPDATE)
+    changed_by_user_id = models.CharField(max_length=36, null=True, blank=True)
+    reason = models.CharField(max_length=255, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
-    revoked_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        indexes = [models.Index(fields=("person", "organization_id", "status"), name="external_member_lookup_idx")]
+        ordering = ("person_id", "created_at", "id")
+        indexes = [models.Index(fields=("person", "created_at"), name="engagement_change_person_idx")]
+
+
+class PerformerShiftFact(models.Model):
+    FACT_ASSIGNED = "assigned"
+    FACT_COMPLETED = "completed"
+    FACT_CHOICES = ((FACT_ASSIGNED, "Назначение"), (FACT_COMPLETED, "Завершение"))
+
+    event_id = models.UUIDField(unique=True)
+    person = models.ForeignKey(Person, on_delete=models.PROTECT, related_name="shift_facts")
+    performer_id = models.UUIDField()
+    shift_id = models.UUIDField()
+    assignment_id = models.UUIDField()
+    fact_type = models.CharField(max_length=16, choices=FACT_CHOICES)
+    engagement_type = models.CharField(max_length=32)
+    occurred_at = models.DateTimeField()
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("person_id", "occurred_at", "id")
         constraints = [
-            models.UniqueConstraint(
-                fields=("person", "organization_id"), condition=Q(status="active"), name="uniq_active_external_membership"
-            ),
-            models.CheckConstraint(
-                check=Q(valid_to__isnull=True) | Q(valid_to__gt=models.F("valid_from")),
-                name="external_membership_interval_ck",
-            ),
+            models.UniqueConstraint(fields=("assignment_id", "fact_type"), name="uq_shift_fact_assignment_type"),
         ]
+        indexes = [models.Index(fields=("person", "fact_type", "occurred_at"), name="ix_shift_fact_person_type")]
 
 
-class PerformerProfile(models.Model):
-    STATUS_ACTIVE = "active"
-    STATUS_INACTIVE = "inactive"
-    STATUS_CHOICES = ((STATUS_ACTIVE, "Активен"), (STATUS_INACTIVE, "Неактивен"))
+class OperationsEventInbox(models.Model):
+    OUTCOME_APPLIED = "applied"
+    OUTCOME_DUPLICATE = "duplicate"
+    OUTCOME_IGNORED = "ignored"
+    OUTCOME_PERSON_NOT_FOUND = "person_not_found"
+    OUTCOME_INVALID = "invalid"
+    OUTCOME_CHOICES = (
+        (OUTCOME_APPLIED, "Применено"),
+        (OUTCOME_DUPLICATE, "Дубликат"),
+        (OUTCOME_IGNORED, "Проигнорировано"),
+        (OUTCOME_PERSON_NOT_FOUND, "Персона не найдена"),
+        (OUTCOME_INVALID, "Некорректное"),
+    )
 
-    person = models.OneToOneField(Person, on_delete=models.PROTECT, related_name="performer_profile")
-    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
-    source_version = models.BigIntegerField(default=0)
-    updated_at = models.DateTimeField(auto_now=True)
+    event_id = models.UUIDField(unique=True)
+    event_type = models.CharField(max_length=80)
+    person_id = models.BigIntegerField(null=True, blank=True)
+    assignment_id = models.UUIDField(null=True, blank=True)
+    outcome = models.CharField(max_length=32, choices=OUTCOME_CHOICES)
+    payload = models.JSONField()
+    processed_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ("processed_at", "id")
+        indexes = [models.Index(fields=("outcome", "processed_at"), name="operations_inbox_outcome_idx")]
 
 
 class PersonDocument(models.Model):

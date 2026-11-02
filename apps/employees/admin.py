@@ -2,52 +2,79 @@ from django.contrib import admin
 
 from apps.employees.models import (
     Address,
-    EmploymentEpisode,
-    ExternalMembership,
+    PerformerEngagementTypeChange,
+    PerformerProfile,
+    PerformerShiftFact,
+    PerformerWorkPeriod,
     Person,
+    PersonAddress,
     PersonContact,
     PersonDocument,
     PersonIdentifier,
     PersonMerge,
     PersonNameHistory,
-    PerformerProfile,
-    PositionAssignment,
 )
 
 
 @admin.register(Person)
 class PersonAdmin(admin.ModelAdmin):
-    list_display = ("id", "surname", "firstname", "patronymic", "identity_status", "address")
+    list_display = ("id", "surname", "firstname", "patronymic", "identity_status")
     list_display_links = ("id", "surname", "firstname")
     search_fields = ("surname", "firstname", "patronymic")
     readonly_fields = ("identity_status", "merged_into", "access_event_version", "performer_event_version", "created_at", "updated_at")
 
 
-@admin.register(EmploymentEpisode)
-class EmploymentEpisodeAdmin(admin.ModelAdmin):
-    list_display = ("id", "person", "personnel_number", "status", "starts_at", "ends_at", "source")
-    list_filter = ("status", "source")
+@admin.register(PerformerProfile)
+class PerformerProfileAdmin(admin.ModelAdmin):
+    list_display = (
+        "person",
+        "status",
+        "engagement_type",
+        "engagement_type_validation_status",
+        "medical_book_status",
+        "funnel_stage",
+        "completed_shifts_count",
+        "updated_at",
+    )
+    list_filter = ("status", "engagement_type", "engagement_type_validation_status", "medical_book_status", "funnel_stage")
+    search_fields = ("person__surname", "person__firstname")
+
+
+@admin.register(PerformerWorkPeriod)
+class PerformerWorkPeriodAdmin(admin.ModelAdmin):
+    list_display = ("id", "person", "personnel_number", "engagement_type", "status", "starts_at", "ends_at", "source")
+    list_filter = ("status", "engagement_type", "source")
     search_fields = ("person__surname", "person__firstname", "personnel_number")
 
 
-@admin.register(PositionAssignment)
-class PositionAssignmentAdmin(admin.ModelAdmin):
-    list_display = ("id", "employment_episode", "position_code", "status", "starts_at", "ends_at")
-    list_filter = ("position_code", "status")
+@admin.register(PersonAddress)
+class PersonAddressAdmin(admin.ModelAdmin):
+    list_display = ("id", "person", "address_type", "is_primary", "address", "created_at")
+    list_filter = ("address_type", "is_primary")
+    search_fields = ("person__surname", "person__firstname", "address__full_address")
 
 
-@admin.register(ExternalMembership)
-class ExternalMembershipAdmin(admin.ModelAdmin):
-    list_display = ("id", "person", "organization_id", "status", "valid_from", "valid_to")
-    list_filter = ("status",)
-    search_fields = ("person__surname", "person__firstname", "organization_id")
-
-
-@admin.register(PerformerProfile)
-class PerformerProfileAdmin(admin.ModelAdmin):
-    list_display = ("person", "status", "source_version", "updated_at")
-    list_filter = ("status",)
+@admin.register(PerformerEngagementTypeChange)
+class PerformerEngagementTypeChangeAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "person",
+        "previous_engagement_type",
+        "new_engagement_type",
+        "new_validation_status",
+        "change_source",
+        "created_at",
+    )
+    list_filter = ("change_source", "new_engagement_type", "new_validation_status")
     search_fields = ("person__surname", "person__firstname")
+    readonly_fields = tuple(field.name for field in PerformerEngagementTypeChange._meta.fields)
+
+
+@admin.register(PerformerShiftFact)
+class PerformerShiftFactAdmin(admin.ModelAdmin):
+    list_display = ("id", "person", "fact_type", "assignment_id", "shift_id", "engagement_type", "occurred_at")
+    list_filter = ("fact_type", "engagement_type")
+    search_fields = ("person__surname", "person__firstname", "assignment_id")
 
 
 @admin.register(PersonContact)
@@ -92,6 +119,6 @@ class PersonMergeAdmin(admin.ModelAdmin):
 
 @admin.register(Address)
 class AddressAdmin(admin.ModelAdmin):
-    list_display = ("full_address", "country", "city", "street", "house", "block", "flat")
+    list_display = ("full_address", "country_code", "country", "city", "street", "house", "block", "flat")
     list_display_links = ("full_address",)
     search_fields = ("full_address",)

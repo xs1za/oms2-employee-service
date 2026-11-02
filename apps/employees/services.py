@@ -5,17 +5,24 @@ from datetime import timedelta
 
 from django.utils import timezone
 
-from apps.employees.events import enqueue_identity_changed, enqueue_merge_events, enqueue_performer_profile_changed
+from apps.employees.events import (
+    enqueue_identity_changed,
+    enqueue_merge_events,
+    enqueue_performer_profile_changed,
+)
+from apps.employees.funnel import recompute_funnel_stage, refresh_shift_statistics
 from apps.employees.models import (
-    EmploymentEpisode,
-    ExternalMembership,
+    PerformerEngagementTypeChange,
+    PerformerProfile,
+    PerformerShiftFact,
+    PerformerWorkPeriod,
     Person,
+    PersonAddress,
     PersonContact,
     PersonDocument,
     PersonIdentifier,
     PersonMerge,
     PersonNameHistory,
-    PerformerProfile,
 )
 
 
@@ -32,6 +39,58 @@ def resolve_canonical_person(person: Person) -> Person:
         visited.add(current.pk)
         current = Person.objects.get(pk=current.merged_into_id)
     return current
+
+
+def _sync_address_primary_flags(person: Person) -> None:
+    primary_address_id = (
+        PersonAddress.objects.filter(
+            person=person, address_type=PersonAddress.TYPE_WORK_SEARCH, is_primary=True
+        )
+        .values_list("address_id", flat=True)
+        .first()
+    )
+    for person_address in PersonAddress.objects.filter(person=person).select_related("address"):
+        expected = person_address.address_id == primary_address_id
+        if person_address.address.main_address != expected:
+            person_address.address.main_address = expected
+            person_address.address.save(update_fields=("main_address",))
+
+
+def _move_person_addresses(duplicate: Person, canonical: Person) -> None:
+    canonical_registration = PersonAddress.objects.select_for_update().filter(
+        person=canonical, address_type=PersonAddress.TYPE_REGISTRATION
+    ).exists()
+    canonical_primary_work = PersonAddress.objects.select_for_update().filter(
+        person=canonical, address_type=PersonAddress.TYPE_WORK_SEARCH, is_primary=True
+    ).exists()
+
+    for person_address in PersonAddress.objects.select_for_update().filter(person=duplicate).order_by("id"):
+        if person_address.address_type == PersonAddress.TYPE_REGISTRATION:
+            if canonical_registration:
+                person_address.delete()
+                continue
+            person_address.is_primary = False
+            canonical_registration = True
+        else:
+            if person_address.is_primary and canonical_primary_work:
+                person_address.is_primary = False
+            elif person_address.is_primary:
+                canonical_primary_work = True
+        person_address.person = canonical
+        person_address.save(update_fields=("person", "is_primary", "updated_at"))
+
+    _sync_address_primary_flags(canonical)
+
+
+def _move_shift_facts(duplicate: Person, canonical: Person) -> None:
+    for fact in PerformerShiftFact.objects.select_for_update().filter(person=duplicate).order_by("id"):
+        if PerformerShiftFact.objects.filter(
+            person=canonical, assignment_id=fact.assignment_id, fact_type=fact.fact_type
+        ).exists():
+            fact.delete()
+            continue
+        fact.person = canonical
+        fact.save(update_fields=("person",))
 
 
 @transaction.atomic
@@ -53,13 +112,14 @@ def merge_people(
             return previous, duplicate.merge_record, False
         raise MergeConflict("Person is already merged into another canonical Person")
 
-    duplicate_active_employment = EmploymentEpisode.objects.filter(person=duplicate, status=EmploymentEpisode.STATUS_ACTIVE).exists()
-    canonical_active_employment = EmploymentEpisode.objects.filter(person=canonical, status=EmploymentEpisode.STATUS_ACTIVE).exists()
-    if duplicate_active_employment and canonical_active_employment:
-        raise MergeConflict("Both Persons have an active Platforma employment episode")
-
-    if canonical.address_id is None and duplicate.address_id is not None:
-        canonical.address_id = duplicate.address_id
+    duplicate_active_period = PerformerWorkPeriod.objects.filter(
+        person=duplicate, status=PerformerWorkPeriod.STATUS_ACTIVE
+    ).exists()
+    canonical_active_period = PerformerWorkPeriod.objects.filter(
+        person=canonical, status=PerformerWorkPeriod.STATUS_ACTIVE
+    ).exists()
+    if duplicate_active_period and canonical_active_period:
+        raise MergeConflict("Both Persons have an active PerformerWorkPeriod")
 
     # Keep one active primary contact per kind. Duplicate contacts with the
     # same verified fingerprint remain as revoked audit rows on the alias.
@@ -85,22 +145,11 @@ def merge_people(
         contact.person = canonical
         contact.save(update_fields=("person", "is_primary"))
 
-    # Reparent completed/current episodes only after detecting the active-period conflict.
-    EmploymentEpisode.objects.filter(person=duplicate).update(person=canonical)
+    PerformerWorkPeriod.objects.filter(
+        person=duplicate, status=PerformerWorkPeriod.STATUS_ACTIVE
+    ).update(person=canonical, updated_at=timezone.now())
 
-    for membership in ExternalMembership.objects.select_for_update().filter(person=duplicate).order_by("id"):
-        if membership.status == ExternalMembership.STATUS_ACTIVE and ExternalMembership.objects.filter(
-            person=canonical,
-            organization_id=membership.organization_id,
-            status=ExternalMembership.STATUS_ACTIVE,
-        ).exists():
-            membership.status = ExternalMembership.STATUS_REVOKED
-            membership.valid_to = timezone.now()
-            membership.revoked_at = membership.valid_to
-            membership.save(update_fields=("status", "valid_to", "revoked_at"))
-        else:
-            membership.person = canonical
-            membership.save(update_fields=("person",))
+    _move_person_addresses(duplicate, canonical)
 
     for document in PersonDocument.objects.select_for_update().filter(person=duplicate).order_by("id"):
         matching = None
@@ -147,6 +196,8 @@ def merge_people(
             identifier.person = canonical
             identifier.save(update_fields=("person",))
 
+    _move_shift_facts(duplicate, canonical)
+
     name_history = PersonNameHistory.objects.select_for_update().filter(person=duplicate).order_by("valid_from", "id")
     next_version = (PersonNameHistory.objects.filter(person=canonical).order_by("-version").values_list("version", flat=True).first() or 0) + 1
     for entry in name_history:
@@ -171,18 +222,30 @@ def merge_people(
     duplicate_profile = PerformerProfile.objects.select_for_update().filter(person=duplicate).first()
     canonical_profile = PerformerProfile.objects.select_for_update().filter(person=canonical).first()
     if duplicate_profile and canonical_profile:
+        if duplicate_profile.engagement_type != canonical_profile.engagement_type:
+            PerformerEngagementTypeChange.objects.create(
+                person=canonical,
+                previous_engagement_type=duplicate_profile.engagement_type,
+                new_engagement_type=canonical_profile.engagement_type,
+                previous_validation_status=duplicate_profile.engagement_type_validation_status,
+                new_validation_status=canonical_profile.engagement_type_validation_status,
+                change_source=PerformerEngagementTypeChange.SOURCE_MERGE,
+                changed_by_user_id=merged_by_user_id,
+                reason="Person merge",
+            )
         duplicate_profile.status = PerformerProfile.STATUS_INACTIVE
         duplicate_profile.save(update_fields=("status", "updated_at"))
     elif duplicate_profile:
         duplicate_profile.person = canonical
         duplicate_profile.save(update_fields=("person", "updated_at"))
+        canonical_profile = duplicate_profile
 
     if duplicate.identity_status == Person.IDENTITY_VERIFIED:
         canonical.identity_status = Person.IDENTITY_VERIFIED
     duplicate.identity_status = Person.IDENTITY_MERGED
     duplicate.merged_into = canonical
     canonical.name_version = max(canonical.name_version, duplicate.name_version, next_version - 1)
-    canonical.save(update_fields=("address", "identity_status", "name_version", "surname", "firstname", "patronymic"))
+    canonical.save(update_fields=("identity_status", "name_version", "surname", "firstname", "patronymic"))
     duplicate.save(update_fields=("identity_status", "merged_into"))
 
     merge_record = PersonMerge.objects.create(
@@ -192,8 +255,13 @@ def merge_people(
         merged_at=timezone.now(),
         merged_by_user_id=merged_by_user_id,
     )
+
+    if canonical_profile is not None:
+        refresh_shift_statistics(canonical, canonical_profile)
+        recompute_funnel_stage(canonical.pk, enqueue=False)
+
     enqueue_identity_changed(canonical, merge_record.merged_at)
     enqueue_merge_events(duplicate, canonical, reason_code, merge_record.merged_at)
-    if hasattr(canonical, "performer_profile"):
+    if canonical_profile is not None:
         enqueue_performer_profile_changed(canonical)
     return canonical, merge_record, True
