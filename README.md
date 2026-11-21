@@ -1,4 +1,4 @@
-# OMS2 Employee Service
+# OMS2 employee service
 
 OMS2 ведет мастер-данные Person и профили исполнителей. Старые /api/employees и HTML-страницы оставлены для совместимости.
 
